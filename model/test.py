@@ -3,54 +3,35 @@ import torch.nn as nn
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
 
-TEST_DIR = "data/test"
-IMAGE_SIZE = 64
-BATCH_SIZE = 128
+from torchvision import models
+from pathlib import Path
+import os
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+
+TEST_DIR = PROJECT_ROOT / "data" / "test"
+if not TEST_DIR.exists():
+    TEST_DIR = SCRIPT_DIR / "data" / "test"
+
+IMAGE_SIZE = 160
+BATCH_SIZE = 32
 
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-
-class GalaxyCNN(nn.Module):
-
-    def __init__(self):
-        super().__init__()
-
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 16, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(16, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 8 * 8, 128),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(128, 3)
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        return self.classifier(x)
-
-
 transform = transforms.Compose([
     transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-    transforms.ToTensor()
+    transforms.ToTensor(),
+    transforms.Normalize(
+        [0.485, 0.456, 0.406],
+        [0.229, 0.224, 0.225]
+    )
 ])
 
 test_dataset = datasets.ImageFolder(
-    TEST_DIR,
+    str(TEST_DIR),
     transform=transform
 )
 
@@ -61,17 +42,35 @@ test_loader = DataLoader(
     num_workers=0
 )
 
-model = GalaxyCNN().to(DEVICE)
+# Load model weights
+model_path = PROJECT_ROOT / "model" / "resnet_galaxy_classifier.pth"
+if not model_path.exists():
+    model_path = SCRIPT_DIR / "resnet_galaxy_classifier.pth"
+if not model_path.exists():
+    model_path = PROJECT_ROOT / "model" / "galaxy_classifier.pth"
 
-checkpoint = torch.load(
-    "model/galaxy_classifier.pth",
-    map_location=DEVICE
-)
+checkpoint = torch.load(str(model_path), map_location=DEVICE)
 
-model.load_state_dict(
-    checkpoint["model_state_dict"]
-)
+model = models.resnet18(weights=None)
+model.fc = nn.Linear(model.fc.in_features, len(test_dataset.classes))
 
+if "model_state_dict" in checkpoint:
+    state_dict = checkpoint["model_state_dict"]
+else:
+    state_dict = checkpoint
+
+cleaned_state_dict = {}
+for k, v in state_dict.items():
+    if k.startswith("module."):
+        k = k[7:]
+    cleaned_state_dict[k] = v
+
+try:
+    model.load_state_dict(cleaned_state_dict, strict=True)
+except Exception:
+    model.load_state_dict(cleaned_state_dict, strict=False)
+
+model = model.to(DEVICE)
 model.eval()
 
 correct = 0

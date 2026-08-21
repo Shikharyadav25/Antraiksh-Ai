@@ -3,10 +3,20 @@ import torch.nn as nn
 from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader
 from sklearn.metrics import confusion_matrix, classification_report
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
+from pathlib import Path
+import os
 
-VAL_DIR = "data/val"
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+
+VAL_DIR = PROJECT_ROOT / "data" / "val"
+if not VAL_DIR.exists():
+    VAL_DIR = SCRIPT_DIR / "data" / "val"
+
 IMAGE_SIZE = 160
 BATCH_SIZE = 16
 
@@ -26,7 +36,7 @@ transform = transforms.Compose([
 ])
 
 dataset = datasets.ImageFolder(
-    VAL_DIR,
+    str(VAL_DIR),
     transform=transform
 )
 
@@ -49,8 +59,12 @@ model.fc = nn.Linear(
     3
 )
 
+model_path = PROJECT_ROOT / "model" / "resnet_galaxy_classifier.pth"
+if not model_path.exists():
+    model_path = SCRIPT_DIR / "resnet_galaxy_classifier.pth"
+
 checkpoint = torch.load(
-    "model/resnet_galaxy_classifier.pth",
+    str(model_path),
     map_location=DEVICE
 )
 
@@ -111,7 +125,7 @@ print(cm)
 
 plt.figure(figsize=(7, 6))
 
-plt.imshow(cm)
+plt.imshow(cm, cmap=plt.cm.Blues)
 
 plt.title("AntraikshAI Galaxy Classification")
 plt.xlabel("Predicted")
@@ -135,16 +149,15 @@ for i in range(len(classes)):
             i,
             cm[i, j],
             ha="center",
-            va="center"
+            va="center",
+            color="white" if cm[i, j] > cm.max() / 2.0 else "black"
         )
 
 plt.tight_layout()
 
-plt.savefig(
-    "model/confusion_matrix.png"
-)
-
-plt.show()
+save_path = SCRIPT_DIR / "confusion_matrix.png"
+plt.savefig(save_path, dpi=300)
+plt.close()
 
 print("\nConfusion matrix saved to:")
-print("model/confusion_matrix.png")
+print(save_path)

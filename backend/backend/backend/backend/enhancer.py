@@ -25,7 +25,7 @@ def enhance_image(
             "Invalid image"
         )
 
-    denoised = cv2.fastNlMeansDenoisingC
+    denoised = cv2.fastNlMeansDenoisingColored(
         image,
         None,
         7,

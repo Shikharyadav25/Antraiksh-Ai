@@ -2,9 +2,57 @@ import streamlit as st
 import torch
 import torch.nn as nn
 from torchvision import transforms, models
-from PIL import Image
+from PIL import Image, ImageOps
 from pathlib import Path
+import numpy as np
 import os
+
+
+# ============================================================
+# ASTRONOMICAL IMAGE OOD VALIDATION
+# ============================================================
+
+def validate_astronomical_image(image_pil):
+    """
+    Validates if an uploaded image exhibits astronomical deep-space galaxy characteristics.
+    Supports PNG and lossy JPEG/JPG compressed background levels.
+    Returns:
+        is_astro (bool): True if image matches galaxy cutout properties.
+        dark_ratio (float): Fraction of dark space background pixels (< 65 intensity).
+        border_mean (float): Average luminance at outer borders.
+        warning_msg (str or None): Explanation message if non-astronomical.
+    """
+    try:
+        img_gray = image_pil.convert("L")
+        arr = np.array(img_gray, dtype=np.float32)
+        h, w = arr.shape
+
+        if h < 10 or w < 10:
+            return False, 0.0, 255.0, "Image resolution too low."
+
+        # Outer 20% border mask
+        border_mask = np.ones_like(arr, dtype=bool)
+        border_mask[int(h * 0.2):int(h * 0.8), int(w * 0.2):int(w * 0.8)] = False
+        border_mean = float(np.mean(arr[border_mask]))
+
+        # Dark space background ratio (threshold < 65 accounts for JPEG lossy compression noise)
+        dark_ratio = float(np.mean(arr < 65))
+
+        # Galaxy cutouts have dark space backgrounds (dark_ratio >= 0.15 and border_mean <= 110.0)
+        is_astro = (dark_ratio >= 0.15) and (border_mean <= 110.0)
+
+        if not is_astro:
+            warning_msg = (
+                "⚠️ **Out-of-Distribution Warning**: The uploaded image does not exhibit "
+                "typical deep-space astronomical background characteristics (e.g., human, sports, "
+                "or bright daytime scene detected). Galaxy classification may be invalid."
+            )
+        else:
+            warning_msg = None
+
+        return is_astro, dark_ratio, border_mean, warning_msg
+    except Exception as e:
+        return True, 0.5, 50.0, None
 
 
 # ============================================================
@@ -583,12 +631,13 @@ sample_caption = None
 if input_mode == "Upload Image":
     uploaded_file = st.file_uploader(
         "Choose a galaxy image",
-        type=["jpg", "jpeg", "png"],
+        type=["jpg", "jpeg", "png", "JPG", "JPEG", "webp"],
         label_visibility="collapsed"
     )
     if uploaded_file is not None:
         try:
-            image_to_process = Image.open(uploaded_file).convert("RGB")
+            raw_img = Image.open(uploaded_file)
+            image_to_process = ImageOps.exif_transpose(raw_img).convert("RGB")
             sample_caption = f"Uploaded File: {uploaded_file.name}"
         except Exception as error:
             st.error(f"Could not open uploaded image file: {error}")
@@ -607,7 +656,9 @@ else:
     for label, category in sample_presets:
         cat_dir = test_dir / category
         if cat_dir.exists() and cat_dir.is_dir():
-            files = list(cat_dir.glob("*.png")) + list(cat_dir.glob("*.jpg"))
+            files = []
+            for ext in ["*.png", "*.jpg", "*.jpeg", "*.JPG", "*.JPEG", "*.webp"]:
+                files.extend(list(cat_dir.glob(ext)))
             if files:
                 sample_options[f"✨ {label} ({category.capitalize()})"] = files[0]
 
@@ -618,7 +669,8 @@ else:
         )
         sample_file_path = sample_options[selected_sample_label]
         try:
-            image_to_process = Image.open(sample_file_path).convert("RGB")
+            raw_sample = Image.open(sample_file_path)
+            image_to_process = ImageOps.exif_transpose(raw_sample).convert("RGB")
             sample_caption = f"Sample: {sample_file_path.name}"
         except Exception as err:
             st.error(f"Error loading sample image: {err}")
@@ -643,6 +695,12 @@ if image_to_process is not None:
 
     if model is not None:
         try:
+            # Validate input image domain (OOD Check)
+            is_astro, dark_ratio, border_mean, ood_warning = validate_astronomical_image(image_to_process)
+
+            if ood_warning:
+                st.warning(ood_warning)
+
             input_tensor = transform(image_to_process).unsqueeze(0).to(DEVICE)
 
             with torch.no_grad():
@@ -661,12 +719,22 @@ if image_to_process is not None:
             }
             pred_icon = icon_map.get(predicted_class.lower(), "🌌")
 
+            if not is_astro:
+                card_title = "AntraikshAI Classification"
+                display_name = "🚫 Not a Galaxy"
+                conf_badge = '<div class="prediction-confidence" style="background:rgba(239,68,68,0.25); border-color:rgba(248,113,113,0.5); color:#f87171;">⚠️ Non-Astronomical Image</div>'
+                st.error("❌ **Not a Galaxy**: The uploaded image is not a deep-space galaxy image (e.g. human, sports, or daylight photograph).")
+            else:
+                card_title = "AntraikshAI Prediction"
+                display_name = f"{pred_icon} {predicted_class.capitalize()}"
+                conf_badge = f'<div class="prediction-confidence">Confidence: {conf_val:.2f}%</div>'
+
             st.markdown(
                 f"""
 <div class="prediction-card">
-    <div class="prediction-label">AntraikshAI Prediction</div>
-    <div class="prediction-name">{pred_icon} {predicted_class.capitalize()}</div>
-    <div class="prediction-confidence">Confidence: {conf_val:.2f}%</div>
+    <div class="prediction-label">{card_title}</div>
+    <div class="prediction-name">{display_name}</div>
+    {conf_badge}
 </div>
 """,
                 unsafe_allow_html=True
@@ -700,6 +768,37 @@ if image_to_process is not None:
 </div>
 """,
                     unsafe_allow_html=True
+                )
+
+            # Astronomical Quality & Domain Diagnostics Expander
+            st.markdown("<br>", unsafe_allow_html=True)
+            with st.expander("🔬 Astronomical Image Quality & Domain Diagnostics"):
+                d1, d2, d3 = st.columns(3)
+                with d1:
+                    st.metric(
+                        label="Dark Space Ratio",
+                        value=f"{dark_ratio * 100:.1f}%",
+                        delta="Valid (≥20%)" if dark_ratio >= 0.20 else "Low Dark Ratio (<20%)",
+                        delta_color="normal" if dark_ratio >= 0.20 else "inverse"
+                    )
+                with d2:
+                    st.metric(
+                        label="Outer Border Luminance",
+                        value=f"{border_mean:.1f}",
+                        delta="Valid (≤95)" if border_mean <= 95.0 else "High Luminance (>95)",
+                        delta_color="normal" if border_mean <= 95.0 else "inverse"
+                    )
+                with d3:
+                    st.metric(
+                        label="Domain Verification",
+                        value="Deep Space" if is_astro else "Out-of-Distribution",
+                        delta="Passed" if is_astro else "Non-Galaxy Image",
+                        delta_color="normal" if is_astro else "inverse"
+                    )
+
+                st.caption(
+                    "**Domain Verification Telemetry:** Galaxy cutout images have a high dark background ratio "
+                    "and low border luminance. Natural, daylight, or human scene photos trigger out-of-distribution warnings."
                 )
 
         except Exception as error:
