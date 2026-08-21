@@ -1,882 +1,272 @@
+from pathlib import Path
+
+import numpy as np
 import streamlit as st
 import torch
 import torch.nn as nn
-from torchvision import transforms, models
 from PIL import Image, ImageOps
-from pathlib import Path
-import numpy as np
-import os
-
-
-# ============================================================
-# ASTRONOMICAL IMAGE OOD VALIDATION
-# ============================================================
-
-def validate_astronomical_image(image_pil):
-    """
-    Validates if an uploaded image exhibits astronomical deep-space galaxy characteristics.
-    Supports PNG and lossy JPEG/JPG compressed background levels.
-    Returns:
-        is_astro (bool): True if image matches galaxy cutout properties.
-        dark_ratio (float): Fraction of dark space background pixels (< 65 intensity).
-        border_mean (float): Average luminance at outer borders.
-        warning_msg (str or None): Explanation message if non-astronomical.
-    """
-    try:
-        img_gray = image_pil.convert("L")
-        arr = np.array(img_gray, dtype=np.float32)
-        h, w = arr.shape
-
-        if h < 10 or w < 10:
-            return False, 0.0, 255.0, "Image resolution too low."
-
-        # Outer 20% border mask
-        border_mask = np.ones_like(arr, dtype=bool)
-        border_mask[int(h * 0.2):int(h * 0.8), int(w * 0.2):int(w * 0.8)] = False
-        border_mean = float(np.mean(arr[border_mask]))
-
-        # Dark space background ratio (threshold < 65 accounts for JPEG lossy compression noise)
-        dark_ratio = float(np.mean(arr < 65))
-
-        # Galaxy cutouts have dark space backgrounds (dark_ratio >= 0.15 and border_mean <= 110.0)
-        is_astro = (dark_ratio >= 0.15) and (border_mean <= 110.0)
-
-        if not is_astro:
-            warning_msg = (
-                "⚠️ **Out-of-Distribution Warning**: The uploaded image does not exhibit "
-                "typical deep-space astronomical background characteristics (e.g., human, sports, "
-                "or bright daytime scene detected). Galaxy classification may be invalid."
-            )
-        else:
-            warning_msg = None
-
-        return is_astro, dark_ratio, border_mean, warning_msg
-    except Exception as e:
-        return True, 0.5, 50.0, None
-
-
-# ============================================================
-# PAGE CONFIG
-# ============================================================
+from torchvision import models, transforms
 
 st.set_page_config(
-    page_title="AntraikshAI • Galaxy Morphology Classifier",
+    page_title="AntraikshAI | Galaxy Classifier",
     page_icon="🌌",
     layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-DEFAULT_CLASSES = ["elliptical", "irregular", "spiral"]
-IMAGE_SIZE = 160
-
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
+    initial_sidebar_state="expanded",
 )
 
 BASE_DIR = Path(__file__).resolve().parent
-
-
-# ============================================================
-# FIND MODEL
-# ============================================================
-
+IMAGE_SIZE = 160
+DEFAULT_CLASSES = ["elliptical", "irregular", "spiral"]
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_CANDIDATES = [
-    "resnet_galaxy_classifier.pth",
-    "resnet_galaxy_classifier.pt",
     "model/resnet_galaxy_classifier.pth",
-    "model/resnet_galaxy_classifier.pt",
+    "resnet_galaxy_classifier.pth",
+    "model/galaxy_classifier.pth",
+    "galaxy_classifier.pth",
     "best_model.pth",
     "best_model.pt",
-    "model/best_model.pth",
-    "galaxy_classifier.pth",
-    "model/galaxy_classifier.pth",
 ]
 
+CLASS_DESCRIPTIONS = {
+    "elliptical": {
+        "icon": "🪐",
+        "title": "Elliptical",
+        "text": "Smooth, rounded light profiles dominated by older stars and very little visible dust or arm structure.",
+        "color": "#f59e0b",
+    },
+    "irregular": {
+        "icon": "✨",
+        "title": "Irregular",
+        "text": "Asymmetric or disturbed galaxies without a clean disk, bulge, or spiral-arm pattern.",
+        "color": "#ec4899",
+    },
+    "spiral": {
+        "icon": "🌀",
+        "title": "Spiral",
+        "text": "Disk galaxies with a brighter central region and winding arms containing gas, dust, and young stars.",
+        "color": "#06b6d4",
+    },
+}
 
-def find_model_file():
-    # First check explicit candidates
-    for relative_path in MODEL_CANDIDATES:
-        path = BASE_DIR / relative_path
-        if path.exists() and path.is_file():
-            return path
-
-    # Next search recursively for .pth or .pt files
-    possible_files = []
-    for extension in ("*.pth", "*.pt"):
-        possible_files.extend(BASE_DIR.rglob(extension))
-
-    if not possible_files:
-        return None
-
-    # Prefer files with 'resnet' in their name
-    resnet_files = [f for f in possible_files if "resnet" in f.name.lower()]
-    if resnet_files:
-        return resnet_files[0]
-
-    keywords = ["best", "model", "galaxy", "classifier"]
-    preferred = [
-        f for f in possible_files
-        if any(kw in f.name.lower() for kw in keywords)
+PREPROCESS = transforms.Compose(
+    [
+        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ]
-
-    if preferred:
-        return preferred[0]
-
-    return possible_files[0]
+)
 
 
-# ============================================================
-# CREATE MODEL
-# ============================================================
-
-def create_model(num_classes=3):
-    model = models.resnet18(weights=None)
-    model.fc = nn.Linear(
-        model.fc.in_features,
-        num_classes
+def inject_css() -> None:
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+        html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+        .stApp {
+            background:
+                radial-gradient(circle at top left, rgba(99, 102, 241, .30), transparent 32rem),
+                radial-gradient(circle at top right, rgba(14, 165, 233, .18), transparent 28rem),
+                linear-gradient(135deg, #050816 0%, #0f172a 55%, #020617 100%);
+            color: #e5e7eb;
+        }
+        .block-container { max-width: 1180px; padding-top: 2rem; }
+        [data-testid="stSidebar"] { background: rgba(2, 6, 23, .88); border-right: 1px solid rgba(148, 163, 184, .18); }
+        [data-testid="stSidebar"] * { color: #dbeafe !important; }
+        .hero {
+            padding: 2rem; border: 1px solid rgba(148, 163, 184, .18); border-radius: 28px;
+            background: linear-gradient(135deg, rgba(15, 23, 42, .84), rgba(30, 41, 59, .52));
+            box-shadow: 0 28px 90px rgba(0,0,0,.35); margin-bottom: 1.5rem;
+        }
+        .eyebrow { color:#a5b4fc; font-weight:800; letter-spacing:.18em; font-size:.78rem; text-transform:uppercase; }
+        .hero h1 { color:white; font-size: clamp(2.3rem, 6vw, 4.9rem); line-height:1; margin:.55rem 0; }
+        .hero p { color:#cbd5e1; max-width: 760px; font-size:1.08rem; line-height:1.7; }
+        .glass-card {
+            height: 100%; padding: 1.15rem; border-radius: 20px; border: 1px solid rgba(148, 163, 184, .18);
+            background: rgba(15, 23, 42, .68); box-shadow: 0 12px 34px rgba(0,0,0,.22);
+        }
+        .metric-title { color:#94a3b8; text-transform:uppercase; letter-spacing:.12em; font-size:.75rem; font-weight:700; }
+        .metric-value { color:#fff; font-size:1.55rem; font-weight:800; margin-top:.35rem; }
+        .prediction {
+            text-align:center; padding:1.6rem; border-radius:24px; border:1px solid rgba(129,140,248,.42);
+            background:linear-gradient(135deg, rgba(79,70,229,.26), rgba(14,165,233,.12));
+        }
+        .prediction-name { color:#fff; font-size:2.25rem; font-weight:800; margin:.3rem 0; }
+        .badge { display:inline-block; border-radius:999px; padding:.35rem .8rem; background:rgba(34,197,94,.16); color:#86efac; border:1px solid rgba(74,222,128,.34); font-weight:800; }
+        .bar-bg { height: 12px; background: rgba(148,163,184,.16); border-radius:999px; overflow:hidden; margin:.35rem 0 1rem; }
+        .bar-fill { height:100%; border-radius:999px; }
+        .footer { color:#94a3b8; text-align:center; padding:2rem 0 1rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
+
+
+def find_model_file() -> Path | None:
+    for candidate in MODEL_CANDIDATES:
+        path = BASE_DIR / candidate
+        if path.is_file():
+            return path
+    return next(BASE_DIR.glob("**/*.pth"), None)
+
+
+def build_resnet(num_classes: int) -> nn.Module:
+    model = models.resnet18(weights=None)
+    model.fc = nn.Linear(model.fc.in_features, num_classes)
     return model
 
 
-# ============================================================
-# LOAD MODEL
-# ============================================================
-
-@st.cache_resource
-def load_model():
+@st.cache_resource(show_spinner="Loading galaxy classifier...")
+def load_model() -> tuple[nn.Module | None, Path | None, list[str], str | None]:
     model_path = find_model_file()
-
     if model_path is None:
-        return None, None, DEFAULT_CLASSES, "No .pth or .pt model file was found in the workspace."
+        return None, None, DEFAULT_CLASSES, "No PyTorch checkpoint was found. The app will still open, but inference is disabled."
 
     try:
-        checkpoint = torch.load(
-            model_path,
-            map_location=DEVICE,
-            weights_only=False
-        )
+        checkpoint = torch.load(model_path, map_location=DEVICE, weights_only=False)
+        classes = checkpoint.get("classes", DEFAULT_CLASSES) if isinstance(checkpoint, dict) else DEFAULT_CLASSES
+        state_dict = checkpoint.get("model_state_dict", checkpoint.get("state_dict", checkpoint)) if isinstance(checkpoint, dict) else None
+        if state_dict is None:
+            return checkpoint.to(DEVICE).eval(), model_path, classes, None
 
-        classes = DEFAULT_CLASSES
-        state_dict = None
-
-        if isinstance(checkpoint, nn.Module):
-            model = checkpoint
-        else:
-            if isinstance(checkpoint, dict):
-                if "classes" in checkpoint and isinstance(checkpoint["classes"], list):
-                    classes = checkpoint["classes"]
-
-                if "model_state_dict" in checkpoint:
-                    state_dict = checkpoint["model_state_dict"]
-                elif "state_dict" in checkpoint:
-                    state_dict = checkpoint["state_dict"]
-                elif "model" in checkpoint and isinstance(checkpoint["model"], dict):
-                    state_dict = checkpoint["model"]
-                else:
-                    state_dict = checkpoint
-
-            if state_dict is None:
-                return None, model_path, classes, "Could not extract state_dict from model file."
-
-            cleaned_state_dict = {}
-            for key, value in state_dict.items():
-                if key.startswith("module."):
-                    key = key[7:]
-                cleaned_state_dict[key] = value
-
-            model = create_model(num_classes=len(classes))
-            
-            # Load state dict strictly if possible, fallback to non-strict
-            try:
-                model.load_state_dict(cleaned_state_dict, strict=True)
-            except Exception:
-                model.load_state_dict(cleaned_state_dict, strict=False)
-
-        model = model.to(DEVICE)
-        model.eval()
-
-        return model, model_path, classes, None
-
-    except Exception as error:
-        return None, model_path, DEFAULT_CLASSES, f"Model loading error: {error}"
+        state_dict = {key.removeprefix("module."): value for key, value in state_dict.items()}
+        model = build_resnet(len(classes))
+        incompatible = model.load_state_dict(state_dict, strict=False)
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            st.toast("Loaded checkpoint with minor architecture differences.", icon="ℹ️")
+        return model.to(DEVICE).eval(), model_path, classes, None
+    except Exception as exc:
+        return None, model_path, DEFAULT_CLASSES, f"Could not load checkpoint: {exc}"
 
 
-# ============================================================
-# IMAGE TRANSFORMATION
-# ============================================================
+def validate_astronomical_image(image: Image.Image) -> tuple[bool, float, float]:
+    gray = np.asarray(image.convert("L"), dtype=np.float32)
+    h, w = gray.shape
+    border = np.ones_like(gray, dtype=bool)
+    border[int(h * 0.2): int(h * 0.8), int(w * 0.2): int(w * 0.8)] = False
+    dark_ratio = float(np.mean(gray < 70))
+    border_mean = float(np.mean(gray[border]))
+    return dark_ratio >= 0.15 and border_mean <= 120, dark_ratio, border_mean
 
-transform = transforms.Compose([
-    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
+
+def predict(image: Image.Image, model: nn.Module, classes: list[str]) -> tuple[str, float, list[float]]:
+    tensor = PREPROCESS(image).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        probabilities = torch.softmax(model(tensor), dim=1)[0].detach().cpu().numpy()
+    top_index = int(np.argmax(probabilities))
+    return classes[top_index], float(probabilities[top_index]), probabilities.tolist()
+
+
+def sample_images() -> dict[str, Path]:
+    samples = {}
+    for path in [BASE_DIR / "test_spiral.jpeg", BASE_DIR / "test_spiral.jpg", *sorted((BASE_DIR / "scratch" / "verification_samples").glob("*.jp*g"))]:
+        if path.is_file():
+            samples[path.name] = path
+    return samples
+
+
+def probability_bar(label: str, pct: float) -> None:
+    key = label.lower()
+    color = CLASS_DESCRIPTIONS.get(key, {}).get("color", "#818cf8")
+    st.markdown(
+        f"""
+        <div style="display:flex;justify-content:space-between;font-weight:700;color:#e2e8f0;">
+            <span>{label.capitalize()}</span><span>{pct:.1f}%</span>
+        </div>
+        <div class="bar-bg"><div class="bar-fill" style="width:{pct:.1f}%;background:{color};"></div></div>
+        """,
+        unsafe_allow_html=True,
     )
-])
 
 
-# ============================================================
-# CSS STYLING
-# ============================================================
-
-st.markdown(
-    """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&display=swap');
-
-html, body, [class*="css"] {
-    font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif;
-}
-
-.stApp {
-    background:
-        radial-gradient(circle at 15% 15%, rgba(68, 56, 160, 0.4), transparent 40%),
-        radial-gradient(circle at 85% 20%, rgba(14, 116, 144, 0.35), transparent 40%),
-        radial-gradient(circle at 50% 80%, rgba(126, 34, 206, 0.25), transparent 50%),
-        linear-gradient(135deg, #050716 0%, #090d26 50%, #041021 100%);
-    color: #e2e8f0;
-}
-
-.block-container {
-    max-width: 1100px;
-    padding-top: 1.8rem;
-    padding-bottom: 3rem;
-}
-
-/* Sidebar styling */
-[data-testid="stSidebar"] {
-    background: rgba(10, 15, 36, 0.95);
-    border-right: 1px solid rgba(255, 255, 255, 0.08);
-    backdrop-filter: blur(12px);
-}
-
-[data-testid="stSidebar"] * {
-    color: #cbd5e1 !important;
-}
-
-[data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3, [data-testid="stSidebar"] h4 {
-    color: #ffffff !important;
-}
-
-/* Input & radio text contrast */
-[data-testid="stWidgetLabel"], [data-testid="stRadio"] label p, label p {
-    color: #f1f5f9 !important;
-    font-weight: 600 !important;
-}
-
-.logo-container {
-    text-align: center;
-    margin-top: 5px;
-    margin-bottom: 20px;
-}
-
-.logo {
-    font-size: 34px;
-    font-weight: 800;
-    letter-spacing: -0.5px;
-    background: linear-gradient(135deg, #ffffff 0%, #a5b4fc 60%, #818cf8 100%);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-}
-
-.logo-icon {
-    font-size: 36px;
-    margin-right: 10px;
-    -webkit-text-fill-color: initial;
-}
-
-.subtitle {
-    margin-top: 4px;
-    color: #94a3b8;
-    font-size: 13px;
-    font-weight: 500;
-    letter-spacing: 1.2px;
-    text-transform: uppercase;
-}
-
-.hero {
-    text-align: center;
-    padding: 35px 20px 25px 20px;
-}
-
-.badge {
-    display: inline-block;
-    padding: 6px 16px;
-    border-radius: 9999px;
-    background: rgba(99, 102, 241, 0.15);
-    border: 1px solid rgba(129, 140, 248, 0.35);
-    color: #c7d2fe;
-    font-size: 12px;
-    font-weight: 700;
-    letter-spacing: 1.5px;
-    margin-bottom: 16px;
-    box-shadow: 0 0 15px rgba(99, 102, 241, 0.2);
-}
-
-.hero-title {
-    font-size: 48px;
-    font-weight: 800;
-    margin-bottom: 14px;
-    color: #ffffff;
-    line-height: 1.15;
-}
-
-.hero-subtitle {
-    color: #cbd5e1;
-    font-size: 17px;
-    max-width: 700px;
-    margin: auto;
-    line-height: 1.6;
-}
-
-.info-card {
-    background: rgba(255, 255, 255, 0.035);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 16px;
-    padding: 20px;
-    text-align: center;
-    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
-    backdrop-filter: blur(8px);
-    transition: transform 0.2s ease, border-color 0.2s ease;
-}
-
-.info-card:hover {
-    border-color: rgba(129, 140, 248, 0.4);
-    transform: translateY(-2px);
-}
-
-.model-number {
-    color: #f8fafc;
-    font-size: 22px;
-    font-weight: 700;
-    margin-bottom: 6px;
-}
-
-.model-label {
-    color: #94a3b8;
-    font-size: 12px;
-    letter-spacing: 0.8px;
-    text-transform: uppercase;
-    font-weight: 600;
-}
-
-.card-title {
-    color: #818cf8;
-    font-size: 18px;
-    font-weight: 700;
-    margin-bottom: 8px;
-}
-
-.card-description {
-    color: #cbd5e1;
-    font-size: 14px;
-    line-height: 1.5;
-}
-
-.section-title {
-    text-align: center;
-    color: #ffffff;
-    font-size: 26px;
-    font-weight: 700;
-    margin-top: 40px;
-    margin-bottom: 8px;
-}
-
-.section-description {
-    text-align: center;
-    color: #94a3b8;
-    font-size: 15px;
-    margin-bottom: 24px;
-}
-
-.prediction-card {
-    margin-top: 20px;
-    padding: 26px;
-    border-radius: 20px;
-    background: linear-gradient(135deg, rgba(99, 102, 241, 0.15), rgba(30, 41, 59, 0.6));
-    border: 1px solid rgba(129, 140, 248, 0.3);
-    backdrop-filter: blur(10px);
-    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
-    text-align: center;
-}
-
-.prediction-label {
-    color: #a5b4fc;
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 2px;
-    font-weight: 700;
-}
-
-.prediction-name {
-    color: #ffffff;
-    font-size: 36px;
-    font-weight: 800;
-    margin: 8px 0;
-}
-
-.prediction-confidence {
-    display: inline-block;
-    padding: 6px 18px;
-    border-radius: 9999px;
-    background: rgba(34, 197, 94, 0.2);
-    border: 1px solid rgba(74, 222, 128, 0.4);
-    color: #4ade80;
-    font-size: 15px;
-    font-weight: 700;
-}
-
-.probability-container {
-    margin-top: 16px;
-}
-
-.probability-header {
-    display: flex;
-    justify-content: space-between;
-    color: #e2e8f0;
-    font-size: 14px;
-    font-weight: 600;
-    margin-bottom: 6px;
-}
-
-.probability-bar {
-    height: 10px;
-    width: 100%;
-    background: rgba(255, 255, 255, 0.08);
-    border-radius: 20px;
-    overflow: hidden;
-}
-
-.probability-fill {
-    height: 100%;
-    border-radius: 20px;
-    transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.fill-elliptical {
-    background: linear-gradient(90deg, #f59e0b, #fbbf24);
-}
-
-.fill-irregular {
-    background: linear-gradient(90deg, #ec4899, #f472b6);
-}
-
-.fill-spiral {
-    background: linear-gradient(90deg, #06b6d4, #38bdf8);
-}
-
-.footer {
-    text-align: center;
-    color: #64748b;
-    font-size: 13px;
-    margin-top: 60px;
-    padding-top: 20px;
-    border-top: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-[data-testid="stFileUploader"] {
-    background: rgba(255, 255, 255, 0.025);
-    border: 1px dashed rgba(129, 140, 248, 0.4);
-    border-radius: 16px;
-    padding: 15px;
-}
-
-[data-testid="stFileUploader"]:hover {
-    border-color: rgba(129, 140, 248, 0.7);
-    background: rgba(255, 255, 255, 0.04);
-}
-</style>
-""",
-    unsafe_allow_html=True
-)
-
-
-# ============================================================
-# LOGO & HERO
-# ============================================================
-
-st.markdown(
-    """
-<div class="logo-container">
-    <div class="logo">
-        <span class="logo-icon">🌌</span>AntraikshAI
-    </div>
-    <div class="subtitle">
-        Deep Learning • Astronomy • Galaxy Intelligence
-    </div>
-</div>
-
-<div class="hero">
-    <div class="badge">
-        ✦ DEEP LEARNING • ASTROPHYSICS • COMPUTER VISION
-    </div>
-    <div class="hero-title">
-        Galaxy Classification
-    </div>
-    <div class="hero-subtitle">
-        Decode the morphology of distant galaxies in real-time using
-        Deep Residual Networks (ResNet18) and PyTorch.
-    </div>
-</div>
-""",
-    unsafe_allow_html=True
-)
-
-
-# ============================================================
-# LOAD MODEL & SIDEBAR
-# ============================================================
-
-model, model_path, CLASSES, model_error = load_model()
+inject_css()
+model, model_path, classes, model_error = load_model()
 
 with st.sidebar:
-    st.markdown("### 🌌 AntraikshAI Control Panel")
-    st.markdown("---")
-    st.markdown("#### 🔭 Hubble Morphology Guide")
-    st.markdown("""
-    - **Elliptical (E0-E7):** Smooth, featureless, elliptical light distributions with minimal gas/dust.
-    - **Spiral (Sa-Sc / SBa-SBc):** Rotating disks with spiral arms, rich gas, and ongoing star formation.
-    - **Irregular (Irr I/II):** Asymmetric shapes lacking a clear bulge or spiral structure.
-    """)
-
-
-# ============================================================
-# MODEL CARDS
-# ============================================================
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.markdown(
-        """
-<div class="info-card">
-    <div class="model-number">ResNet18</div>
-    <div class="model-label">Deep Learning Model</div>
-</div>
-""",
-        unsafe_allow_html=True
-    )
-
-with col2:
-    st.markdown(
-        f"""
-<div class="info-card">
-    <div class="model-number">{len(CLASSES)}</div>
-    <div class="model-label">Galaxy Classes</div>
-</div>
-""",
-        unsafe_allow_html=True
-    )
-
-with col3:
-    device_name = "GPU (CUDA)" if DEVICE.type == "cuda" else "CPU"
-    st.markdown(
-        f"""
-<div class="info-card">
-    <div class="model-number">{device_name}</div>
-    <div class="model-label">Inference Device</div>
-</div>
-""",
-        unsafe_allow_html=True
-    )
-
-
-# ============================================================
-# MODEL STATUS
-# ============================================================
-
-if model_error:
-    st.error(f"⚠️ {model_error}")
-else:
-    st.success(f"✅ Model weights active: **{model_path.name}**")
-
-
-# ============================================================
-# CLASSIFICATION SECTION
-# ============================================================
-
-st.markdown(
-    """
-<div class="section-title">
-    Explore Galaxy Morphology
-</div>
-
-<div class="section-description">
-    Upload an astronomical image or choose a sample galaxy from our dataset to perform inference.
-</div>
-""",
-    unsafe_allow_html=True
-)
-
-
-# ============================================================
-# INPUT MODE SELECTION & SAMPLE IMAGES
-# ============================================================
-
-input_mode = st.radio(
-    "Choose input source:",
-    ["Upload Image", "Sample Galaxy Image"],
-    horizontal=True,
-    label_visibility="collapsed"
-)
-
-image_to_process = None
-sample_caption = None
-
-if input_mode == "Upload Image":
-    uploaded_file = st.file_uploader(
-        "Choose a galaxy image",
-        type=["jpg", "jpeg", "png", "JPG", "JPEG", "webp"],
-        label_visibility="collapsed"
-    )
-    if uploaded_file is not None:
-        try:
-            raw_img = Image.open(uploaded_file)
-            image_to_process = ImageOps.exif_transpose(raw_img).convert("RGB")
-            sample_caption = f"Uploaded File: {uploaded_file.name}"
-        except Exception as error:
-            st.error(f"Could not open uploaded image file: {error}")
-
-else:
-    # Look for sample test images
-    sample_options = {}
-    test_dir = BASE_DIR / "data" / "test"
-
-    sample_presets = [
-        ("Spiral Galaxy Sample", "spiral"),
-        ("Elliptical Galaxy Sample", "elliptical"),
-        ("Irregular Galaxy Sample", "irregular"),
-    ]
-
-    for label, category in sample_presets:
-        cat_dir = test_dir / category
-        if cat_dir.exists() and cat_dir.is_dir():
-            files = []
-            for ext in ["*.png", "*.jpg", "*.jpeg", "*.JPG", "*.JPEG", "*.webp"]:
-                files.extend(list(cat_dir.glob(ext)))
-            if files:
-                sample_options[f"✨ {label} ({category.capitalize()})"] = files[0]
-
-    if sample_options:
-        selected_sample_label = st.selectbox(
-            "Select a sample image from the test set:",
-            options=list(sample_options.keys())
-        )
-        sample_file_path = sample_options[selected_sample_label]
-        try:
-            raw_sample = Image.open(sample_file_path)
-            image_to_process = ImageOps.exif_transpose(raw_sample).convert("RGB")
-            sample_caption = f"Sample: {sample_file_path.name}"
-        except Exception as err:
-            st.error(f"Error loading sample image: {err}")
+    st.title("🌌 AntraikshAI")
+    st.caption("Simple Streamlit UI for galaxy morphology demos.")
+    st.divider()
+    st.write("**Model status**")
+    if model_error:
+        st.warning(model_error)
     else:
-        st.warning("No sample dataset images found in data/test directory.")
+        st.success(f"Loaded `{model_path.name}`")
+    st.write("**Device**", "CUDA GPU" if DEVICE.type == "cuda" else "CPU")
+    st.write("**Classes**", ", ".join(c.capitalize() for c in classes))
+    st.divider()
+    st.info("Best results come from cropped, deep-space galaxy images with a dark background.")
 
+st.markdown(
+    """
+    <section class="hero">
+        <div class="eyebrow">Computer Vision • Astronomy • Streamlit</div>
+        <h1>Galaxy Morphology Classifier</h1>
+        <p>Upload a galaxy image and get a quick, presentable morphology prediction across elliptical, irregular, and spiral classes. The backend stays intentionally lightweight for demos and portfolio reviews.</p>
+    </section>
+    """,
+    unsafe_allow_html=True,
+)
 
-# ============================================================
-# PREDICTION PROCESSOR
-# ============================================================
+m1, m2, m3 = st.columns(3)
+with m1:
+    st.markdown('<div class="glass-card"><div class="metric-title">Architecture</div><div class="metric-value">ResNet-18</div></div>', unsafe_allow_html=True)
+with m2:
+    st.markdown(f'<div class="glass-card"><div class="metric-title">Classes</div><div class="metric-value">{len(classes)}</div></div>', unsafe_allow_html=True)
+with m3:
+    st.markdown(f'<div class="glass-card"><div class="metric-title">Runtime</div><div class="metric-value">Streamlit</div></div>', unsafe_allow_html=True)
 
-if image_to_process is not None:
+st.subheader("Try the classifier")
+input_mode = st.radio("Input source", ["Upload image", "Use sample"], horizontal=True)
+image = None
+caption = None
 
-    image_col1, image_col2, image_col3 = st.columns([1, 2, 1])
-
-    with image_col2:
-        st.image(
-            image_to_process,
-            caption=sample_caption or "Selected Galaxy",
-            use_container_width=True
-        )
-
-    if model is not None:
-        try:
-            # Validate input image domain (OOD Check)
-            is_astro, dark_ratio, border_mean, ood_warning = validate_astronomical_image(image_to_process)
-
-            if ood_warning:
-                st.warning(ood_warning)
-
-            input_tensor = transform(image_to_process).unsqueeze(0).to(DEVICE)
-
-            with torch.no_grad():
-                output = model(input_tensor)
-                probabilities = torch.softmax(output, dim=1)
-                confidence, predicted_index = torch.max(probabilities, dim=1)
-
-            pred_idx = predicted_index.item()
-            conf_val = confidence.item() * 100
-            predicted_class = CLASSES[pred_idx]
-
-            icon_map = {
-                "elliptical": "🪐",
-                "irregular": "✨",
-                "spiral": "🌀"
-            }
-            pred_icon = icon_map.get(predicted_class.lower(), "🌌")
-
-            if not is_astro:
-                card_title = "AntraikshAI Classification"
-                display_name = "🚫 Not a Galaxy"
-                conf_badge = '<div class="prediction-confidence" style="background:rgba(239,68,68,0.25); border-color:rgba(248,113,113,0.5); color:#f87171;">⚠️ Non-Astronomical Image</div>'
-                st.error("❌ **Not a Galaxy**: The uploaded image is not a deep-space galaxy image (e.g. human, sports, or daylight photograph).")
-            else:
-                card_title = "AntraikshAI Prediction"
-                display_name = f"{pred_icon} {predicted_class.capitalize()}"
-                conf_badge = f'<div class="prediction-confidence">Confidence: {conf_val:.2f}%</div>'
-
-            st.markdown(
-                f"""
-<div class="prediction-card">
-    <div class="prediction-label">{card_title}</div>
-    <div class="prediction-name">{display_name}</div>
-    {conf_badge}
-</div>
-""",
-                unsafe_allow_html=True
-            )
-
-            st.markdown(
-                """
-<div class="section-title" style="font-size:22px; margin-top:30px;">
-    Classification Probabilities
-</div>
-""",
-                unsafe_allow_html=True
-            )
-
-            prob_list = probabilities[0].detach().cpu().tolist()
-
-            for class_name, prob in zip(CLASSES, prob_list):
-                pct = prob * 100
-                fill_class = f"fill-{class_name.lower()}"
-
-                st.markdown(
-                    f"""
-<div class="probability-container">
-    <div class="probability-header">
-        <span>{class_name.capitalize()}</span>
-        <span>{pct:.2f}%</span>
-    </div>
-    <div class="probability-bar">
-        <div class="probability-fill {fill_class}" style="width:{pct:.2f}%"></div>
-    </div>
-</div>
-""",
-                    unsafe_allow_html=True
-                )
-
-            # Astronomical Quality & Domain Diagnostics Expander
-            st.markdown("<br>", unsafe_allow_html=True)
-            with st.expander("🔬 Astronomical Image Quality & Domain Diagnostics"):
-                d1, d2, d3 = st.columns(3)
-                with d1:
-                    st.metric(
-                        label="Dark Space Ratio",
-                        value=f"{dark_ratio * 100:.1f}%",
-                        delta="Valid (≥20%)" if dark_ratio >= 0.20 else "Low Dark Ratio (<20%)",
-                        delta_color="normal" if dark_ratio >= 0.20 else "inverse"
-                    )
-                with d2:
-                    st.metric(
-                        label="Outer Border Luminance",
-                        value=f"{border_mean:.1f}",
-                        delta="Valid (≤95)" if border_mean <= 95.0 else "High Luminance (>95)",
-                        delta_color="normal" if border_mean <= 95.0 else "inverse"
-                    )
-                with d3:
-                    st.metric(
-                        label="Domain Verification",
-                        value="Deep Space" if is_astro else "Out-of-Distribution",
-                        delta="Passed" if is_astro else "Non-Galaxy Image",
-                        delta_color="normal" if is_astro else "inverse"
-                    )
-
-                st.caption(
-                    "**Domain Verification Telemetry:** Galaxy cutout images have a high dark background ratio "
-                    "and low border luminance. Natural, daylight, or human scene photos trigger out-of-distribution warnings."
-                )
-
-        except Exception as error:
-            st.error(f"Inference error: {error}")
+if input_mode == "Upload image":
+    uploaded = st.file_uploader("Upload a JPG, PNG, or WebP galaxy image", type=["jpg", "jpeg", "png", "webp"])
+    if uploaded:
+        image = ImageOps.exif_transpose(Image.open(uploaded)).convert("RGB")
+        caption = uploaded.name
+else:
+    samples = sample_images()
+    if samples:
+        selected = st.selectbox("Choose a bundled sample", list(samples))
+        image = ImageOps.exif_transpose(Image.open(samples[selected])).convert("RGB")
+        caption = selected
     else:
-        st.warning("Model is not loaded. Please verify model weights.")
+        st.warning("No bundled sample images were found.")
 
+if image:
+    left, right = st.columns([0.95, 1.05], vertical_alignment="top")
+    with left:
+        st.image(image, caption=caption, use_container_width=True)
+    with right:
+        is_astro, dark_ratio, border_mean = validate_astronomical_image(image)
+        if not is_astro:
+            st.warning("This image does not look like a dark-background deep-space cutout, so treat any prediction as a demo only.")
+        if model is None:
+            st.error("Inference is unavailable because no compatible checkpoint was loaded.")
+        else:
+            label, confidence, probabilities = predict(image, model, classes)
+            icon = CLASS_DESCRIPTIONS.get(label.lower(), {}).get("icon", "🌌")
+            st.markdown(
+                f'<div class="prediction"><div class="eyebrow">Prediction</div><div class="prediction-name">{icon} {label.capitalize()}</div><span class="badge">Confidence {confidence * 100:.1f}%</span></div>',
+                unsafe_allow_html=True,
+            )
+            st.write("")
+            for class_name, probability in zip(classes, probabilities):
+                probability_bar(class_name, probability * 100)
+        with st.expander("Image diagnostics"):
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Dark background", f"{dark_ratio * 100:.1f}%")
+            c2.metric("Border luminance", f"{border_mean:.1f}")
+            c3.metric("Domain check", "Likely galaxy" if is_astro else "Review image")
 
-# ============================================================
-# GALAXY MORPHOLOGY CLASSES GUIDE
-# ============================================================
-
-st.markdown(
-    """
-<div class="section-title">
-    Galaxy Morphologies
-</div>
-
-<div class="section-description">
-    Understanding the structural properties classified by AntraikshAI.
-</div>
-""",
-    unsafe_allow_html=True
-)
-
-class_col1, class_col2, class_col3 = st.columns(3)
-
-with class_col1:
-    st.markdown(
-        """
-<div class="info-card">
-    <div class="card-title">🪐 Elliptical</div>
-    <div class="card-description">
-        Smooth, rounded light profiles ranging from spherical to elongated ellipsoids, containing older stellar populations.
-    </div>
-</div>
-""",
-        unsafe_allow_html=True
+st.subheader("Morphology quick guide")
+g1, g2, g3 = st.columns(3)
+for column, key in zip([g1, g2, g3], ["elliptical", "spiral", "irregular"]):
+    item = CLASS_DESCRIPTIONS[key]
+    column.markdown(
+        f'<div class="glass-card"><div style="font-size:2rem">{item["icon"]}</div><h3 style="color:white;margin:.35rem 0">{item["title"]}</h3><p style="color:#cbd5e1">{item["text"]}</p></div>',
+        unsafe_allow_html=True,
     )
 
-with class_col2:
-    st.markdown(
-        """
-<div class="info-card">
-    <div class="card-title">🌀 Spiral</div>
-    <div class="card-description">
-        Flat rotating disks containing bright spiral arms of gas, cosmic dust, and young blue star clusters.
-    </div>
-</div>
-""",
-        unsafe_allow_html=True
-    )
-
-with class_col3:
-    st.markdown(
-        """
-<div class="info-card">
-    <div class="card-title">✨ Irregular</div>
-    <div class="card-description">
-        Disrupted or chaotic morphology without central symmetry, often shaped by gravitational tidal interactions.
-    </div>
-</div>
-""",
-        unsafe_allow_html=True
-    )
-
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.markdown(
-    """
-<div class="footer">
-    AntraikshAI • Deep Learning for Galaxy Morphology Classification
-    <br><br>
-    Built with PyTorch • Torchvision • Streamlit
-</div>
-""",
-    unsafe_allow_html=True
-)
+st.markdown('<div class="footer">Built with Streamlit, PyTorch, Torchvision, Pillow, and NumPy.</div>', unsafe_allow_html=True)
